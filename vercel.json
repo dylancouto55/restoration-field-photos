@@ -1,0 +1,10 @@
+{
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ],
+  "env": {
+    "JOBBER_CLIENT_ID": "@jobber-client-id",
+    "JOBBER_CLIENT_SECRET": "@jobber-client-secret"
+  }
+}
