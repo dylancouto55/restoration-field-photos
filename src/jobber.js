@@ -6,7 +6,7 @@ const JOBBER_GRAPHQL = '/api/jobber/graphql';
 export async function fetchJobberJobs(accessToken) {
   const query = `
     query {
-      jobs(first: 50, sortOrder: DESC) {
+      jobs(first: 50) {
         nodes {
           id
           title
