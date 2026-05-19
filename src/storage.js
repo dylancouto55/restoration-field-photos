@@ -53,6 +53,33 @@ export async function deleteAllPhotos() {
   await photoStore.clear();
 }
 
+export async function updatePhotoSyncStatus(id, syncStatus, syncError = null, cloudinaryUrl = null, retryCount = null) {
+  const photo = await photoStore.getItem(id);
+  if (!photo) return null;
+  photo.syncStatus = syncStatus;
+  if (syncError !== null) photo.syncError = syncError;
+  if (cloudinaryUrl) photo.cloudinaryUrl = cloudinaryUrl;
+  if (retryCount !== null) photo.retryCount = retryCount;
+  await photoStore.setItem(id, photo);
+  return photo;
+}
+
+export async function getPendingPhotos() {
+  const pending = [];
+  await photoStore.iterate((val) => {
+    if (val.syncStatus === 'pending' || val.syncStatus === 'failed') pending.push(val);
+  });
+  return pending.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+export async function getFailedPhotos() {
+  const failed = [];
+  await photoStore.iterate((val) => {
+    if (val.syncStatus === 'failed') failed.push(val);
+  });
+  return failed;
+}
+
 // ── Settings ────────────────────────────────────────────────────────
 export async function getSettings() {
   return (await settingsStore.getItem('config')) || {};

@@ -108,6 +108,23 @@ export async function exchangeJobberCode(code) {
   return res.json(); // { access_token, refresh_token, expires_in }
 }
 
+// Create a note with photo attachment on a Jobber job
+export async function createJobNote(accessToken, { jobberId, message, attachmentUrls }) {
+  const res = await fetch('/api/jobber/create-note', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({ jobberId, message, attachmentUrls })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Create note failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 // Refresh access token
 export async function refreshJobberToken(refreshToken) {
   const res = await fetch('/api/jobber/refresh', {

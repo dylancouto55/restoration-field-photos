@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as db from './storage';
 import { compressImage, uid, fmtDate, fmtTime, fmtDateTime } from './utils';
-import { fetchJobberJobs, startJobberAuth, refreshJobberToken } from './jobber';
+import { fetchJobberJobs, startJobberAuth, refreshJobberToken, createJobNote } from './jobber';
+import { uploadPhoto as uploadToCloudinary } from './cloudinary';
+import { UploadQueue } from './uploadQueue';
 
 // ─── Color tokens ───────────────────────────────────────────────────
 const C = {
@@ -85,7 +87,32 @@ const IC = {
   refresh: 'M23 4v6h-6 M1 20v-6h6 M3.51 9a9 9 0 0 1 14.85-3.36L23 10 M1 14l4.64 4.36A9 9 0 0 0 20.49 15',
   layers: 'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5',
   map: 'M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z M12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+  cloud: 'M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z',
+  cloudDone: 'M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z M9 15l2 2 4-4',
 };
+
+// ─── Sync Badge ────────────────────────────────────────────────────
+function SyncBadge({ status, onRetry }) {
+  if (!status || status === 'local') return null;
+  const configs = {
+    pending: { color: C.textDim, icon: IC.cloud, label: 'Queued' },
+    uploading: { color: C.blue, icon: IC.cloud, label: 'Uploading' },
+    uploaded: { color: C.accent, icon: IC.cloudDone, label: 'Synced' },
+    failed: { color: C.warn, icon: IC.cloud, label: 'Failed' },
+  };
+  const cfg = configs[status] || configs.pending;
+  return (
+    <div onClick={status === 'failed' && onRetry ? (e) => { e.stopPropagation(); onRetry(); } : undefined}
+      title={cfg.label} style={{
+        position: 'absolute', bottom: 3, right: 3, width: 22, height: 22, borderRadius: 11,
+        background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        cursor: status === 'failed' ? 'pointer' : 'default',
+        animation: status === 'uploading' ? 'spin 1.5s linear infinite' : 'none'
+      }}>
+      <Icon d={cfg.icon} size={13} color={cfg.color} />
+    </div>
+  );
+}
 
 // ─── Lightbox ───────────────────────────────────────────────────────
 function Lightbox({ photo, onClose }) {
@@ -376,7 +403,7 @@ function CaptureScreen({ jobs, onCapture, onDone }) {
 }
 
 // ─── Gallery Screen ─────────────────────────────────────────────────
-function GalleryScreen({ photos, jobs, onDelete }) {
+function GalleryScreen({ photos, jobs, onDelete, onRetryPhoto }) {
   const [lightbox, setLightbox] = useState(null);
   const [filter, setFilter] = useState('all');
   const filtered = filter === 'all' ? photos : photos.filter(p => p.tag === filter);
@@ -423,6 +450,7 @@ function GalleryScreen({ photos, jobs, onDelete }) {
                 }}>
                 <Icon d={IC.trash} size={11} color={C.warn} />
               </button>
+              <SyncBadge status={p.syncStatus} onRetry={() => onRetryPhoto?.(p.id)} />
             </div>
           ))}
         </div>
@@ -434,7 +462,7 @@ function GalleryScreen({ photos, jobs, onDelete }) {
 }
 
 // ─── Job Detail ─────────────────────────────────────────────────────
-function JobDetail({ job, photos, onBack, onEditJob, onDeletePhoto }) {
+function JobDetail({ job, photos, onBack, onEditJob, onDeletePhoto, onRetryPhoto }) {
   const [lightbox, setLightbox] = useState(null);
   const [filter, setFilter] = useState('all');
   const jobPhotos = photos.filter(p => p.jobId === job.id);
@@ -505,6 +533,7 @@ function JobDetail({ job, photos, onBack, onEditJob, onDeletePhoto }) {
                 }}>
                 <Icon d={IC.trash} size={11} color={C.warn} />
               </button>
+              <SyncBadge status={p.syncStatus} onRetry={() => onRetryPhoto?.(p.id)} />
             </div>
           ))}
         </div>
@@ -610,11 +639,22 @@ export default function App() {
   const [jobberTokens, setJobberTokens] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState(null);
+  const [online, setOnline] = useState(navigator.onLine);
+  const queueRef = useRef(null);
 
   const showToast = (msg, dur = 3000) => {
     setToast(msg);
     setTimeout(() => setToast(null), dur);
   };
+
+  // ── Online/offline tracking ──────────────────────────────────────
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off); };
+  }, []);
 
   // ── Load everything on mount ──────────────────────────────────────
   useEffect(() => {
@@ -696,6 +736,65 @@ export default function App() {
     }
   }, [loaded, jobberTokens?.access_token]);
 
+  // ── Upload queue ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (!loaded) return;
+
+    const getValidToken = async () => {
+      const tokens = await db.getJobberTokens();
+      if (!tokens?.access_token) return null;
+      if (tokens.expires_at && Date.now() > tokens.expires_at - 60000) {
+        const refreshed = await refreshJobberToken(tokens.refresh_token);
+        refreshed.expires_at = Date.now() + (refreshed.expires_in * 1000);
+        setJobberTokens(refreshed);
+        await db.saveJobberTokens(refreshed);
+        return refreshed.access_token;
+      }
+      return tokens.access_token;
+    };
+
+    const uploadFn = async (photo) => {
+      const job = photo.jobId ? (await db.getJobs()).find(j => j.id === photo.jobId) : null;
+      const jobberId = job?.jobberId || null;
+
+      const cloudResult = await uploadToCloudinary({
+        photoData: photo.data,
+        jobberId: jobberId || 'unassigned',
+        jobTitle: photo.jobTitle || '',
+        tag: photo.tag || '',
+        note: photo.note || '',
+        photoId: photo.id,
+        timestamp: photo.timestamp
+      });
+
+      if (jobberId) {
+        const token = await getValidToken();
+        if (token) {
+          const noteMsg = [photo.tag && `[${photo.tag.toUpperCase()}]`, photo.note].filter(Boolean).join(' ') || 'Field photo';
+          await createJobNote(token, {
+            jobberId,
+            message: noteMsg,
+            attachmentUrls: [cloudResult.cloudinaryUrl]
+          });
+        }
+      }
+
+      return cloudResult;
+    };
+
+    const onStatusChange = (photoId, status, error, cloudinaryUrl) => {
+      setPhotos(prev => prev.map(p =>
+        p.id === photoId ? { ...p, syncStatus: status, syncError: error || p.syncError, cloudinaryUrl: cloudinaryUrl || p.cloudinaryUrl } : p
+      ));
+    };
+
+    const queue = new UploadQueue({ uploadFn, onStatusChange });
+    queueRef.current = queue;
+    queue.start();
+
+    return () => queue.destroy();
+  }, [loaded]);
+
   // ── Handlers ──────────────────────────────────────────────────────
   const handleSaveJob = async (job) => {
     await db.saveJob(job);
@@ -717,8 +816,14 @@ export default function App() {
   };
 
   const handleCapture = async (photo) => {
+    photo.syncStatus = 'pending';
     await db.savePhoto(photo);
     setPhotos(prev => [photo, ...prev]);
+    if (queueRef.current) queueRef.current.enqueue(photo);
+  };
+
+  const handleRetryPhoto = (photoId) => {
+    if (queueRef.current) queueRef.current.retryPhoto(photoId);
   };
 
   const handleDeletePhoto = async (id) => {
@@ -838,11 +943,24 @@ export default function App() {
         </div>
       )}
 
+      {/* Offline banner */}
+      {!online && (
+        <div style={{
+          position: 'fixed', top: 52, left: 0, right: 0, zIndex: 200,
+          background: C.warnDim, borderBottom: `1px solid ${C.warn}`,
+          padding: '8px 16px', fontSize: 13, fontWeight: 600, color: C.warn,
+          textAlign: 'center'
+        }}>
+          Offline — photos saved locally, will upload when connected
+        </div>
+      )}
+
       {tab === 'jobs' && selectedJob && (
         <JobDetail job={selectedJob} photos={photos}
           onBack={() => setSelectedJob(null)}
           onEditJob={j => setJobModal(j)}
-          onDeletePhoto={handleDeletePhoto} />
+          onDeletePhoto={handleDeletePhoto}
+          onRetryPhoto={handleRetryPhoto} />
       )}
 
       {tab === 'capture' && (
@@ -850,7 +968,7 @@ export default function App() {
       )}
 
       {tab === 'photos' && (
-        <GalleryScreen photos={photos} jobs={jobs} onDelete={handleDeletePhoto} />
+        <GalleryScreen photos={photos} jobs={jobs} onDelete={handleDeletePhoto} onRetryPhoto={handleRetryPhoto} />
       )}
 
       {tab === 'settings' && (
